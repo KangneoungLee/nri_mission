@@ -1,3 +1,5 @@
 # nri_mission
 
-local way point generation
+
+local way point generation (c++/ROS2)
+
