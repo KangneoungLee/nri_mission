@@ -1,0 +1,23 @@
+<message generation>
+
+
+rosidl_adapter.parser.InvalidFieldDefinition:  float64 latitude_goal
+
+
+https://stackoverflow.com/questions/71970577/ros2-custom-messages-build-failed-with-invalidfielddefinition
+https://github.com/ros2/rosidl/issues/414
+
+---- bug of ROS2 : even though I define the .msg file, the parser.py return error. Solution open empty txt file and write down the content and copy&paste into .msg file
+/opt/ros/humble/local/lib/python3.10/dist-packages/rosidl_adapter/parser.py 
+type_string, _, rest = line.partition(' ')
+        rest = rest.lstrip()
+        if not rest:
+            print('Error with:', pkg_name, msg_name, line, file=sys.stderr)
+            raise InvalidFieldDefinition(line)
+            
+            
+            
+because another
+  target with the same name already exists.
+  
+  --> set(executable_name nri_mission_server) should define different name with project name
