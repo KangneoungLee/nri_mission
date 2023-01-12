@@ -1,7 +1,9 @@
 #include "nri_mission_runner/nri_mission_runner.hpp"
 #include "rclcpp/rclcpp.hpp"
+//#include "boost/bind.hpp>
 
-using std::placeholders::_1;
+using namespace std::placeholders;
+//using std::placeholders::_1;
 using namespace std::chrono_literals;
 
 namespace nri_mission_runner
@@ -49,19 +51,67 @@ NriMissionRunner::NriMissionRunner(const rclcpp::NodeOptions & options):Node("nr
 
     StatePub_ = this->create_publisher<std_msgs::msg::Int8>(MissionStatePubTopic, 10);
     
+    this->declare_parameter("nri_mission_gps_lat_init", rclcpp::ParameterValue(30.616914));
+    this->declare_parameter("nri_mission_gps_long_init", rclcpp::ParameterValue(-96.340988));
+    
+    this->get_parameter("nri_mission_gps_lat_init", GpsLat_Init_);
+    this->get_parameter("nri_mission_gps_long_init", GpsLong_Init_);
+    
+    GpsPosSub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>("mavros/global_position", 10, std::bind(&NriMissionRunner::GpsPosCallback, this, _1)); 
+    
+    goal_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("goal_pose", 1);
+    
+    nav2_action_client_ = rclcpp_action::create_client<nav2_msgs::action::NavigateToPose>(this, this->get_name());
 
     //ParamClient();
     //Loop();
+    
+    m01_stat_ = mission_status::init;
 
 }
 
-void NriMissionRunner::ParamClient()
+void NriMissionRunner::Nav2GoalRespondCallback(const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::SharedPtr & goal_handle)
 {
-       auto node = this->shared_from_this();
+    if (!goal_handle) {
+      RCLCPP_ERROR(this->get_logger(), "Goal was rejected by NavigateToPose server");
+      if(stat_mach_idx.current == 1) m01_is_sent_goal_ = false;
+    } else {
+      RCLCPP_INFO(this->get_logger(), "Goal accepted by NavigateToPose server, waiting for result");
+      if(stat_mach_idx.current == 1) m01_is_accepted_goal_ = true;
+    }
+
+}
+
+void NriMissionRunner::Nav2FbCallback(
+    rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::SharedPtr, const std::shared_ptr<const nav2_msgs::action::NavigateToPose::Feedback> feedback)
+{
+}
+
+void NriMissionRunner::Nav2ResultCallback(const rclcpp_action::ClientGoalHandle<nav2_msgs::action::NavigateToPose>::WrappedResult & result)
+{
+   switch (result.code) {
+      case rclcpp_action::ResultCode::SUCCEEDED:
+        if(stat_mach_idx.current == 1) m01_is_success_goal_ = true;
+        break;
+      case rclcpp_action::ResultCode::ABORTED:
+        RCLCPP_ERROR(this->get_logger(), "NavigateToPose Goal was aborted");
+        return;
+      case rclcpp_action::ResultCode::CANCELED:
+        RCLCPP_ERROR(this->get_logger(), "NavigateToPose Goal was canceled");
+        return;
+      default:
+        RCLCPP_ERROR(this->get_logger(), "NavigateToPose Unknown result code");
+        return;
+}
+}
+
+bool NriMissionRunner::ParamClient()
+{
+       auto node = this->shared_from_this(); // should not be declared in the class constructor
        GlobalCostParam_client_ = std::make_shared<rclcpp::AsyncParametersClient>(node, "global_costmap/global_costmap");
        LocalCostParam_client_ = std::make_shared<rclcpp::AsyncParametersClient>(node, "local_costmap/local_costmap");
        ControlSrvParam_client_ = std::make_shared<rclcpp::AsyncParametersClient>(node, "controller_server");      
-       ParamSrv_ready_ = ParamClientReady();
+       return ParamClientReady();
          
 }
 
@@ -193,6 +243,22 @@ bool NriMissionRunner::UpdateGCP(double origin_x, double origin_y)
 
 }
 
+void NriMissionRunner::GpsPosCallback(const sensor_msgs::msg::NavSatFix & msg)
+{
+   if((MissionAct_ == 1)&&(ParamLoad_ok_ == false)&&(GpsInit_SetId_ == 0))
+   {
+   
+      GpsLat_Init_ = msg.latitude;
+      GpsLong_Init_ = msg.longitude;
+      GpsInit_SetId_ = 1;
+   }
+   else if((MissionAct_ == 1)&&(ParamLoad_ok_ == true)&&(GpsInit_SetId_ == 0))
+   {
+      GpsInit_SetId_ = 2; // just bypass the initial gps position from parameter
+   
+   }
+}
+
 void NriMissionRunner::GpsCmdCallback(const nri_msgs::msg::NriWaypointGps & msg)
 {
    if(MissionAct_ == 0)
@@ -200,11 +266,11 @@ void NriMissionRunner::GpsCmdCallback(const nri_msgs::msg::NriWaypointGps & msg)
        MissionNum_ = 1;
        MissionAct_ = 1;
        
-       GpsGoal_.push_back({msg.latitude_goal, msg.longitude_goal, msg.headang_goal_deg, msg.is_in_field});
+       m01_GpsGoal_.push_back({msg.latitude_goal, msg.longitude_goal, msg.headang_goal_deg, msg.is_in_field});
    
        RCLCPP_INFO(get_logger(), "****Gps goal recieved****");
-       RCLCPP_INFO(get_logger(), "ID : %d Latitude : %f longitude : %f heading angle : %f is in field : %d", 0, GpsGoal_[0].latitude_goal,
-       GpsGoal_[0].longitude_goal, GpsGoal_[0].headang_goal_deg, GpsGoal_[0].is_in_field);
+       RCLCPP_INFO(get_logger(), "ID : %d Latitude : %f longitude : %f heading angle : %f is in field : %d", 0, m01_GpsGoal_[0].latitude_goal,
+       m01_GpsGoal_[0].longitude_goal, m01_GpsGoal_[0].headang_goal_deg, m01_GpsGoal_[0].is_in_field);
    }
    else
    {
@@ -225,9 +291,9 @@ void NriMissionRunner::MultiGpsCmdCallback(const nri_msgs::msg::NriWaypointlistG
        RCLCPP_INFO(get_logger(), "****Gps goal recieved****");
        for (int i=0; i < size ; i ++)
        {
-         GpsGoal_.push_back({msg.latitude_goal[i], msg.longitude_goal[i], msg.headang_goal_deg[i], msg.is_in_field[i]});
-         RCLCPP_INFO(get_logger(), "ID : %d Latitude : %f longitude : %f heading angle : %f is in field : %d", i, GpsGoal_[i].latitude_goal,
-          GpsGoal_[i].longitude_goal, GpsGoal_[i].headang_goal_deg, GpsGoal_[i].is_in_field);
+         m01_GpsGoal_.push_back({msg.latitude_goal[i], msg.longitude_goal[i], msg.headang_goal_deg[i], msg.is_in_field[i]});
+         RCLCPP_INFO(get_logger(), "ID : %d Latitude : %f longitude : %f heading angle : %f is in field : %d", i, m01_GpsGoal_[i].latitude_goal,
+          m01_GpsGoal_[i].longitude_goal, m01_GpsGoal_[i].headang_goal_deg, m01_GpsGoal_[i].is_in_field);
        }
    }
    else
@@ -243,10 +309,10 @@ void NriMissionRunner::XyzCmdCallback(const nri_msgs::msg::NriWaypointXyz & msg)
    {
        MissionNum_ = 2;
        MissionAct_ = 1;
-       XyzGoal_.push_back({msg.x_goal, msg.y_goal, msg.headang_goal_deg, msg.is_in_field});
+       m01_XyzGoal_.push_back({msg.x_goal, msg.y_goal, msg.headang_goal_deg, msg.is_in_field});
        RCLCPP_INFO(get_logger(), "****Xyz goal recieved****");
-       RCLCPP_INFO(get_logger(), "ID : %d X : %f Y : %f heading angle : %f is in field : %d", 0, XyzGoal_[0].x_goal,
-           XyzGoal_[0].y_goal, XyzGoal_[0].headang_goal_deg, XyzGoal_[0].is_in_field);
+       RCLCPP_INFO(get_logger(), "ID : %d X : %f Y : %f heading angle : %f is in field : %d", 0, m01_XyzGoal_[0].x_goal,
+           m01_XyzGoal_[0].y_goal, m01_XyzGoal_[0].headang_goal_deg, m01_XyzGoal_[0].is_in_field);
    }
    else
    {
@@ -267,9 +333,9 @@ void NriMissionRunner::MultiXyzCmdCallback(const nri_msgs::msg::NriWaypointlistX
        RCLCPP_INFO(get_logger(), "****Xyz goal recieved****");
        for (int i=0; i < size ; i ++)
        {
-         XyzGoal_.push_back({msg.x_goal[i], msg.y_goal[i], msg.headang_goal_deg[i], msg.is_in_field[i]});
-         RCLCPP_INFO(get_logger(), "ID : %d Latitude : %f longitude : %f heading angle : %f is in field : %d", i, XyzGoal_[i].x_goal,
-          XyzGoal_[i].y_goal, XyzGoal_[i].headang_goal_deg, XyzGoal_[i].is_in_field);
+         m01_XyzGoal_.push_back({msg.x_goal[i], msg.y_goal[i], msg.headang_goal_deg[i], msg.is_in_field[i]});
+         RCLCPP_INFO(get_logger(), "ID : %d Latitude : %f longitude : %f heading angle : %f is in field : %d", i, m01_XyzGoal_[i].x_goal,
+          m01_XyzGoal_[i].y_goal, m01_XyzGoal_[i].headang_goal_deg, m01_XyzGoal_[i].is_in_field);
        }
    }
    else
@@ -288,20 +354,56 @@ void NriMissionRunner::MissionCancelCallback(const std_msgs::msg::Int8 & msg)
        MissionAct_ = 0;
        
        /*cancel all action */
+       Clear();
        
-       GpsGoal_.clear();
-       XyzGoal_.clear();
+       
        RCLCPP_INFO(get_logger(), "Successfully cancel");
+       
+       
    }
    else
    {
        RCLCPP_INFO(get_logger(), "No mission is running so cancel is ignored");
    }
 }
+void NriMissionRunner::Clear()
+{
+  /* mission 01 variables clear */
+  m01_GpsGoal_.clear();
+  m01_stat_ = mission_status::init;
+  m01_waypoint_x_ = 0;
+  m01_waypoint_y_ = 0;
+  m01_local_goal_x_ = 0;
+  m01_local_goal_y_ = 0;
+  m01_is_sent_goal_ = false;
+  m01_is_accepted_goal_ = false;
+  m01_is_success_goal_ = false;
+  /* cancel the nav2 */
+  
+  /* mission 02 variables clear */
+  m01_XyzGoal_.clear();
+  
+  /* cancel the nav2 */
+  
+  /*common variable clear*/
+  MissionAct_ = 0;
+  MissionNum_ = 0;
+  stat_mach_idx.current = 0;
+  stat_mach_idx.prev = 0;
+  ParamLoad_ok_ = false;
+  UpdateGCP_ok_ = false;
+  RCLCPP_INFO(this->get_logger(), "Internal variables are cleared");
+}
+
+void NriMissionRunner::CurRobotPose()
+{
+
+
+}
 
 void NriMissionRunner::Loop()
 {
-    if (MissionAct_ == 1)
+    if (MissionNum_ == 1)
     {
        MISSION_01();
     }
@@ -315,26 +417,195 @@ void NriMissionRunner::Loop()
 }
 void NriMissionRunner::MISSION_01()
 {
-     WayPointGen_SM_01();
+     bool is_gps_input = true;
+     WayPointGen_ID1(is_gps_input);
 }
 
-void NriMissionRunner::WayPointGen_SM_01()
+void NriMissionRunner::WayPointGen_ID1(bool is_gps_input)
 {
 
-    //ParamSrv_ready_= ParamClientReady();
+
+    if(stat_mach_idx.current == 0) 
+    {
+       stat_mach_idx.current = 1;
+       stat_mach_idx.prev = 0;
+    }
+    else if(stat_mach_idx.current == 1) { /*do the state machine 1 loop*/}
+    else  return;
+    
+    if(is_gps_input == true){
+       if(m01_GpsGoal_.empty() == true)
+       {
+         Clear();
+         return;
+       }
+    }
+    else
+    {
+       if(m01_XyzGoal_.empty() == true)
+       {
+         Clear();
+         return;
+       }
+    
+    }
+    
+    auto GpsGoal = m01_GpsGoal_[0];
+    auto XyzGoal = m01_XyzGoal_[0];
+
+    if(is_gps_input == true){
+       if(GpsGoal.is_in_field == true)
+       {
+          m01_stat_ = mission_status::completed;
+          GpsGoalLat_Infield_ = GpsGoal.latitude_goal;
+          GpsGoalLong_Infield_ = GpsGoal.longitude_goal;
+          stat_mach_idx.prev = 1;
+          stat_mach_idx.current = 3;
+          return;
+       }
+    }
+    else{
+       if(XyzGoal.is_in_field == true)
+       {
+          m01_stat_ = mission_status::completed;
+          //GpsGoalLat_Infield_ = GpsGoal.latitude_goal;
+          //GpsGoalLong_Infield_ = GpsGoal.longitude_goal;
+          stat_mach_idx.prev = 1;
+          stat_mach_idx.current = 3;
+          return;
+       }
+    }
        
     if(ParamSrv_ready_ == false) 
     {
-      ParamClient();
-      return;
+       ParamSrv_ready_ = ParamClient();
+       return;
     }
     else 
     {
        if(ParamLoad_ok_ == false) ParamLoad_ok_ = GetCostMapParam();
+       else m01_stat_ = mission_status::ready;
     }
-    if(UpdateGCP_ok_ == false) UpdateGCP_ok_ = UpdateGCP(2.5,2.5);
+    
+    if(m01_stat_ == mission_status::ready)
+    {
+       if(is_gps_input == true){
+          double cartesian_init_x {};
+          double cartesian_init_y {};
+          double cartesian_init_z {};
+          std::string utm_zone_tmp;
+    
+          navsat_conversions::LLtoUTM(GpsLat_Init_, GpsLong_Init_, cartesian_init_y, cartesian_init_x, utm_zone_tmp);
+          
+          double cartesian_goal_x {};
+          double cartesian_goal_y {};
+          double cartesian_goal_z {};
+           
+          navsat_conversions::LLtoUTM(GpsGoal.latitude_goal, GpsGoal.longitude_goal, cartesian_goal_y, cartesian_goal_x, utm_zone_tmp);
+       
+          m01_waypoint_x_ = cartesian_goal_x - cartesian_init_x;
+          m01_waypoint_y_ = cartesian_goal_y - cartesian_init_y;
+          m01_waypoint_ang_deg_ = GpsGoal.headang_goal_deg;
+       }
+       else{
+            m01_waypoint_x_ = XyzGoal.x_goal;
+            m01_waypoint_y_ = XyzGoal.y_goal;
+            m01_waypoint_ang_deg_ = XyzGoal.headang_goal_deg;
+       }
+       
+       RCLCPP_INFO(this->get_logger(), "m01_waypoint_x_ : %lf m01_waypoint_y_ : %lf", m01_waypoint_x_, m01_waypoint_y_);
+       
+       m01_stat_ = mission_status::processing;
+    }
+    
+
+       
+    if(m01_stat_ == mission_status::processing)
+    {
+       m01_is_final_local_goal_ = PruneGoalPath(globalmap_width_, globalmap_height_, cur_pos_x_, cur_pos_y_, m01_waypoint_x_, m01_waypoint_y_, m01_local_goal_x_, m01_local_goal_y_);
+          // sent a goal
+          
+       auto goal_msg = geometry_msgs::msg::PoseStamped();
+       goal_msg.header.stamp = this->now();
+       goal_msg.pose.position.x = m01_local_goal_x_;
+       goal_msg.pose.position.y = m01_local_goal_y_;
+       
+       double heading_ang_deg_temp = m01_waypoint_ang_deg_;
+       tf2::Quaternion q;
+       q.setRPY(0, 0, heading_ang_deg_temp*PI/180);
+       q.normalize();
+       
+       geometry_msgs::msg::Quaternion msg_quat = tf2::toMsg(q);
+       
+       goal_msg.pose.orientation = msg_quat;
+       
+       if(m01_is_sent_goal_ == false)
+       {
+          if (!this->nav2_action_client_->wait_for_action_server()) {
+            RCLCPP_ERROR(this->get_logger(), "Action server not available after waiting");
+            return;
+         }
+         
+         nav2_msgs::action::NavigateToPose::Goal goal;
+         goal.pose = goal_msg;
+         
+         auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::NavigateToPose>::SendGoalOptions();
+         send_goal_options.goal_response_callback = std::bind(&NriMissionRunner::Nav2GoalRespondCallback, this, _1);
+         send_goal_options.feedback_callback = std::bind(&NriMissionRunner::Nav2FbCallback, this, _1, _2);
+         send_goal_options.result_callback = std::bind(&NriMissionRunner::Nav2ResultCallback, this, _1);
+         nav2_action_client_->async_send_goal(goal, send_goal_options);
+         m01_is_sent_goal_ = true;
+       }
+       
+       if((m01_is_sent_goal_ == true)&&(m01_is_accepted_goal_ == true))
+       {
+         m01_stat_ = mission_status::sent_goal;
+       }
+    }
+      
+    if((m01_is_success_goal_ == true)&&(m01_stat_ == mission_status::sent_goal)) m01_stat_ = mission_status::got_feedback;
+        
+    if((m01_is_final_local_goal_ == false)&&(m01_stat_ == mission_status::got_feedback))
+    {
+        if(UpdateGCP_ok_ == false) UpdateGCP_ok_ = UpdateGCP(cur_pos_x_,cur_pos_y_);
+        else        
+        { 
+           m01_is_sent_goal_ = false;
+           m01_is_accepted_goal_ = false;
+           m01_is_success_goal_ = false;
+           UpdateGCP_ok_ = false; 
+           m01_local_goal_x_ = 0;
+           m01_local_goal_y_ = 0;
+           
+           m01_stat_ = mission_status::processing;
+        }
+    }
+    else if(m01_stat_ == mission_status::got_feedback)
+    {    
+        m01_is_sent_goal_ = false;
+        m01_is_accepted_goal_ = false;
+        m01_is_success_goal_ = false;
+        UpdateGCP_ok_ = false;
+        m01_local_goal_x_ = 0;
+        m01_local_goal_y_ = 0;
+
+        ParamLoad_ok_ = false;
+        m01_is_final_local_goal_ = false;
+        
+        m01_waypoint_x_ = 0;
+        m01_waypoint_y_ = 0;
+        if(is_gps_input == true){
+           m01_GpsGoal_.erase(m01_GpsGoal_.begin());
+        }
+        else{
+           m01_XyzGoal_.erase(m01_XyzGoal_.begin());
+        }
+        
+        m01_stat_ = mission_status::init;
+    }
 
 }
+
 
 
 NriMissionRunner::~NriMissionRunner()

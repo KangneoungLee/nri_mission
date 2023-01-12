@@ -29,8 +29,8 @@ class GpsWaypointPublisher(Node):
 
     def timer_callback(self):
         msg = NriWaypointGps()
-        msg.latitude_goal = float(30.6271981)
-        msg.longitude_goal = float(-96.3303747)
+        msg.latitude_goal = float(30.61736)
+        msg.longitude_goal = float(-96.34044)
         msg.is_in_field = False
         msg.headang_goal_deg = float(60)
         self.publisher_.publish(msg)
